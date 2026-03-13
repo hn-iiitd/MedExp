@@ -49,8 +49,8 @@ router.post('/fetch', async (req, res) => {
     const errors = [];
 
     const insertMedicine = db.prepare(`
-      INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, source, source_identifier)
-      VALUES (?, ?, ?, ?, ?, ?, 'email', ?)
+      INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, mrp, source, source_identifier)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'email', ?)
     `);
 
     const insertProcessed = db.prepare(`
@@ -64,13 +64,18 @@ router.post('/fetch', async (req, res) => {
         const emailDetails = await getEmailDetails(user.access_token, user.refresh_token, msg.id);
         const subject = emailDetails.payload?.headers?.find(h => h.name.toLowerCase() === 'subject')?.value || '';
 
+        // Extract sender email for distributor fallback
+        const fromHeader = emailDetails.payload?.headers?.find(h => h.name.toLowerCase() === 'from')?.value || '';
+        const emailMatch = fromHeader.match(/[\w.\-]+@[\w.\-]+\.\w+/);
+        const senderEmail = emailMatch ? emailMatch[0] : '';
+
         // Find attachments
         const attachments = findAttachments(emailDetails.payload);
 
         for (const att of attachments) {
           try {
             const buffer = await getAttachment(user.access_token, user.refresh_token, msg.id, att.attachmentId);
-            const medicines = await parseBill(buffer, att.filename);
+            const medicines = await parseBill(buffer, att.filename, senderEmail);
 
             if (medicines.length > 0) {
               const transaction = db.transaction(() => {
@@ -82,6 +87,7 @@ router.post('/fetch', async (req, res) => {
                     med.batch_no,
                     med.bill_date,
                     med.distributor_name,
+                    med.mrp,
                     `email_${msg.id}_${att.filename}`
                   );
                 }

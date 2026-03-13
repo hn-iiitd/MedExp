@@ -7,6 +7,7 @@ export default function AddMedicineModal({ onAdd, onClose }) {
     batch_no: '',
     bill_date: '',
     distributor_name: '',
+    mrp: '',
   });
 
   const handleSubmit = (e) => {
@@ -92,6 +93,19 @@ export default function AddMedicineModal({ onAdd, onClose }) {
                 placeholder="e.g. ABC Pharma"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">MRP (₹)</label>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={form.mrp}
+              onChange={handleChange('mrp')}
+              className="input-field"
+              placeholder="e.g. 125.50"
+            />
           </div>
 
           <div className="flex gap-3 pt-2">

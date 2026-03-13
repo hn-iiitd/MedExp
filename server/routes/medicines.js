@@ -30,7 +30,7 @@ router.get('/', (req, res) => {
   const { sort = 'expiry_date', order = 'ASC', search = '' } = req.query;
 
   // Whitelist sort columns to prevent SQL injection
-  const allowedSorts = ['expiry_date', 'medicine_name', 'bill_date', 'distributor_name', 'created_at'];
+  const allowedSorts = ['expiry_date', 'medicine_name', 'bill_date', 'distributor_name', 'mrp', 'created_at'];
   const sortColumn = allowedSorts.includes(sort) ? sort : 'expiry_date';
   const sortOrder = order.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
 
@@ -68,8 +68,8 @@ router.post('/upload', upload.single('bill'), async (req, res) => {
 
     const db = getDb();
     const insertStmt = db.prepare(`
-      INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, source, source_identifier)
-      VALUES (?, ?, ?, ?, ?, ?, 'upload', ?)
+      INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, mrp, source, source_identifier)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'upload', ?)
     `);
 
     let inserted = 0;
@@ -84,6 +84,7 @@ router.post('/upload', upload.single('bill'), async (req, res) => {
           med.batch_no,
           med.bill_date,
           med.distributor_name,
+          med.mrp,
           sourceId
         );
         inserted++;
@@ -105,7 +106,7 @@ router.post('/upload', upload.single('bill'), async (req, res) => {
 
 // POST /api/medicines - Add a single medicine manually
 router.post('/', (req, res) => {
-  const { medicine_name, expiry_date, batch_no, bill_date, distributor_name } = req.body;
+  const { medicine_name, expiry_date, batch_no, bill_date, distributor_name, mrp } = req.body;
 
   if (!medicine_name) {
     return res.status(400).json({ error: 'Medicine name is required' });
@@ -113,9 +114,9 @@ router.post('/', (req, res) => {
 
   const db = getDb();
   const result = db.prepare(`
-    INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, source)
-    VALUES (?, ?, ?, ?, ?, ?, 'manual')
-  `).run(req.user.id, medicine_name, expiry_date || '', batch_no || '', bill_date || '', distributor_name || '');
+    INSERT INTO medicines (user_id, medicine_name, expiry_date, batch_no, bill_date, distributor_name, mrp, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'manual')
+  `).run(req.user.id, medicine_name, expiry_date || '', batch_no || '', bill_date || '', distributor_name || '', mrp || null);
 
   const medicine = db.prepare('SELECT * FROM medicines WHERE id = ?').get(result.lastInsertRowid);
   res.status(201).json(medicine);
@@ -124,7 +125,7 @@ router.post('/', (req, res) => {
 // PUT /api/medicines/:id - Update a medicine
 router.put('/:id', (req, res) => {
   const { id } = req.params;
-  const { medicine_name, expiry_date, batch_no, bill_date, distributor_name } = req.body;
+  const { medicine_name, expiry_date, batch_no, bill_date, distributor_name, mrp } = req.body;
 
   const db = getDb();
   const existing = db.prepare('SELECT * FROM medicines WHERE id = ? AND user_id = ?').get(id, req.user.id);
@@ -135,7 +136,7 @@ router.put('/:id', (req, res) => {
 
   db.prepare(`
     UPDATE medicines SET 
-      medicine_name = ?, expiry_date = ?, batch_no = ?, bill_date = ?, distributor_name = ?
+      medicine_name = ?, expiry_date = ?, batch_no = ?, bill_date = ?, distributor_name = ?, mrp = ?
     WHERE id = ? AND user_id = ?
   `).run(
     medicine_name || existing.medicine_name,
@@ -143,6 +144,7 @@ router.put('/:id', (req, res) => {
     batch_no ?? existing.batch_no,
     bill_date ?? existing.bill_date,
     distributor_name ?? existing.distributor_name,
+    mrp ?? existing.mrp,
     id,
     req.user.id
   );

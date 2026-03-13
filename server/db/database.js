@@ -44,11 +44,15 @@ function initTables() {
       batch_no TEXT,
       bill_date TEXT,
       distributor_name TEXT,
+      mrp REAL,
       source TEXT DEFAULT 'upload',
       source_identifier TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    -- Migration: add mrp column if missing (for existing databases)
+    -- SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we handle it in code
 
     CREATE TABLE IF NOT EXISTS processed_emails (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +68,13 @@ function initTables() {
     CREATE INDEX IF NOT EXISTS idx_medicines_expiry ON medicines(user_id, expiry_date);
     CREATE INDEX IF NOT EXISTS idx_processed_emails ON processed_emails(user_id, message_id);
   `);
+
+  // Migration: add mrp column for existing databases
+  try {
+    db.prepare('SELECT mrp FROM medicines LIMIT 0').run();
+  } catch {
+    db.exec('ALTER TABLE medicines ADD COLUMN mrp REAL');
+  }
 }
 
 module.exports = { getDb };

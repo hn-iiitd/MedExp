@@ -149,6 +149,12 @@ export default function MedicineTable({
               >
                 Distributor <SortIcon field="distributor_name" />
               </th>
+              <th
+                className="text-left py-3 px-3 font-medium text-gray-600 cursor-pointer hover:text-gray-900 select-none"
+                onClick={() => onSort('mrp')}
+              >
+                MRP <SortIcon field="mrp" />
+              </th>
               <th className="text-left py-3 px-3 font-medium text-gray-600">Status</th>
               <th className="text-right py-3 px-6 font-medium text-gray-600">Actions</th>
             </tr>
@@ -176,6 +182,7 @@ export default function MedicineTable({
                   <td className="py-3 px-3 text-gray-600">{med.batch_no || '—'}</td>
                   <td className="py-3 px-3 text-gray-600">{formatDate(med.bill_date)}</td>
                   <td className="py-3 px-3 text-gray-600">{med.distributor_name || '—'}</td>
+                  <td className="py-3 px-3 text-gray-600">{med.mrp != null ? `₹${med.mrp}` : '—'}</td>
                   <td className="py-3 px-3">
                     <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColors[status]}`}>
                       {statusLabels[status]}

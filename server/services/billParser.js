@@ -1,32 +1,85 @@
 // Bill parsing service - extracts medicine data from PDFs and Excel files
+// Column matching uses regex with word boundaries (inspired by Python extraction script)
 const pdfParse = require('pdf-parse');
 const XLSX = require('xlsx');
 
-/**
- * Parse a PDF buffer and extract medicine data.
- * Uses text extraction and pattern matching.
- */
-async function parsePdf(buffer) {
-  const data = await pdfParse(buffer);
-  const text = data.text;
-  return extractMedicineData(text);
-}
+// ─── Column matchers (regex with word boundaries, case-insensitive) ───
+const COL_PATTERNS = {
+  medicine_name: /\b(item\s*name|particulars|item\s*description|description|medicine|drug|product\s*name|product)\b/i,
+  batch_no:      /\b(batch\s*no|batchno|batch|b\.?\s*no\.?|lot\s*no|lot)\b/i,
+  expiry_date:   /\b(expiry|exp\s*dt|exp\s*date|expiration|exp)\b/i,
+  mrp:           /\b(mrp|price|retail\s*price|m\.r\.p|rate)\b/i,
+  distributor:   /\b(distributor|supplier|vendor|party|company)\b/i,
+  bill_date:     /\b(bill\s*date|invoice\s*date|bill\s*dt|inv\s*date|date)\b/i,
+};
 
 /**
- * Parse an Excel buffer and extract medicine data.
+ * Match a column header to a known field using regex word-boundary patterns.
+ * Returns the field key or null.
  */
-function parseExcel(buffer) {
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
+function matchColumn(colName) {
+  const trimmed = colName.trim();
+  for (const [field, regex] of Object.entries(COL_PATTERNS)) {
+    if (regex.test(trimmed)) return field;
+  }
+  return null;
+}
+
+// ─── Excel / CSV parsing ───
+
+/**
+ * Parse an Excel/CSV buffer and extract medicine data.
+ * Optionally accepts senderEmail to use as distributor fallback (for email-sourced files).
+ */
+function parseExcel(buffer, senderEmail = '') {
+  const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
   const medicines = [];
 
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    if (rows.length === 0) continue;
+
+    // Build a mapping: column header → field key
+    const headers = Object.keys(rows[0]);
+    const colMap = {};
+    for (const header of headers) {
+      const field = matchColumn(header);
+      if (field) colMap[header] = field;
+    }
 
     for (const row of rows) {
-      const medicine = mapExcelRow(row);
-      if (medicine && medicine.medicine_name) {
-        medicines.push(medicine);
+      let med = '', batch = '', exp = '', distributor = '', billDate = '';
+      let mrp = null;
+
+      for (const [header, field] of Object.entries(colMap)) {
+        const val = String(row[header] ?? '').trim();
+        if (!val) continue;
+
+        switch (field) {
+          case 'medicine_name': med = val; break;
+          case 'batch_no':      batch = val; break;
+          case 'expiry_date':   exp = val; break;
+          case 'distributor':   distributor = val; break;
+          case 'bill_date':     billDate = val; break;
+          case 'mrp':
+            try { mrp = parseFloat(val); if (isNaN(mrp)) mrp = null; }
+            catch { mrp = null; }
+            break;
+        }
+      }
+
+      // Accept row if ANY of medicine/batch/expiry was found (matches Python logic)
+      if (med || batch || exp) {
+        const distributorValue = distributor || senderEmail || '';
+        medicines.push({
+          medicine_name: med || '-',
+          batch_no: batch || '-',
+          expiry_date: normalizeDate(exp) || '-',
+          bill_date: normalizeDate(billDate),
+          distributor_name: distributorValue,
+          mrp: mrp,
+        });
       }
     }
   }
@@ -34,76 +87,37 @@ function parseExcel(buffer) {
   return medicines;
 }
 
+// ─── PDF parsing ───
+
 /**
- * Map an Excel row to medicine data by matching common column name patterns.
+ * Parse a PDF buffer and extract medicine data.
  */
-function mapExcelRow(row) {
-  const keys = Object.keys(row);
-  const find = (patterns) => {
-    for (const key of keys) {
-      const lower = key.toLowerCase().trim();
-      for (const p of patterns) {
-        if (lower.includes(p)) return row[key];
-      }
-    }
-    return '';
-  };
-
-  const medicineName = find(['medicine', 'drug', 'product', 'item', 'name', 'description', 'particulars']);
-  const expiry = find(['expiry', 'exp', 'expiration', 'exp.', 'exp date']);
-  const batchNo = find(['batch', 'lot', 'b.no', 'b no', 'batch no']);
-  const billDate = find(['bill date', 'invoice date', 'date', 'bill dt']);
-  const distributor = find(['distributor', 'supplier', 'vendor', 'party', 'company', 'from']);
-
-  if (!medicineName) return null;
-
-  return {
-    medicine_name: String(medicineName).trim(),
-    expiry_date: normalizeDate(String(expiry).trim()),
-    batch_no: String(batchNo).trim(),
-    bill_date: normalizeDate(String(billDate).trim()),
-    distributor_name: String(distributor).trim(),
-  };
+async function parsePdf(buffer, senderEmail = '') {
+  const data = await pdfParse(buffer);
+  const text = data.text;
+  return extractMedicineDataFromText(text, senderEmail);
 }
 
 /**
- * Extract medicine data from raw text (PDF content).
- * Tries multiple strategies: tabular, line-by-line pattern matching.
+ * Extract medicine data from raw PDF text.
+ * Strategy 1: Detect a header row and parse subsequent rows as columns.
+ * Strategy 2: Regex-based line scanning for batch/expiry patterns.
  */
-function extractMedicineData(text) {
+function extractMedicineDataFromText(text, senderEmail = '') {
   const medicines = [];
-  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
 
-  // Strategy 1: Look for tabular data patterns
-  // Common bill formats have columns: S.No | Name | Batch | Expiry | Qty | Rate | Amount
-  let headerIndex = -1;
-  let columnMap = {};
-
-  for (let i = 0; i < lines.length; i++) {
-    const lower = lines[i].toLowerCase();
-    if (
-      (lower.includes('batch') || lower.includes('b.no')) &&
-      (lower.includes('expiry') || lower.includes('exp'))
-    ) {
-      headerIndex = i;
-      columnMap = detectColumns(lines[i]);
-      break;
-    }
-  }
-
-  // Strategy 2: Extract bill-level info (date, distributor)
+  // ── Extract bill-level metadata from top of document ──
   let billDate = '';
   let distributorName = '';
 
-  for (const line of lines.slice(0, 15)) {
-    // Look for date patterns
+  for (const line of lines.slice(0, 20)) {
     if (!billDate) {
       const dateMatch = line.match(
-        /(?:date|dt|dated|invoice date|bill date)\s*[:\-]?\s*(\d{1,2}[\/.\\-]\d{1,2}[\/.\\-]\d{2,4})/i
+        /(?:date|dt|dated|invoice\s*date|bill\s*date)\s*[:\-]?\s*(\d{1,2}[\/.\\-]\d{1,2}[\/.\\-]\d{2,4})/i
       );
       if (dateMatch) billDate = normalizeDate(dateMatch[1]);
     }
-    // Look for distributor/company name in first few lines
     if (!distributorName) {
       const distMatch = line.match(
         /(?:from|distributor|supplier|vendor|m\/s|messrs)\s*[:\-]?\s*(.+)/i
@@ -112,176 +126,173 @@ function extractMedicineData(text) {
     }
   }
 
-  // If no distributor found, use first line as company name (common in invoices)
+  // Fallback: use first non-numeric line as distributor
   if (!distributorName && lines.length > 0) {
-    const firstLine = lines[0].trim();
-    if (firstLine.length > 3 && firstLine.length < 100 && !/^\d+$/.test(firstLine)) {
-      distributorName = firstLine;
+    const first = lines[0].trim();
+    if (first.length > 3 && first.length < 100 && !/^\d+$/.test(first)) {
+      distributorName = first;
     }
   }
 
-  if (headerIndex >= 0) {
-    // Parse tabular data after header
-    for (let i = headerIndex + 1; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line || line.match(/^[\-=_]+$/) || line.toLowerCase().includes('total')) break;
+  // Final distributor fallback: sender email
+  if (!distributorName) distributorName = senderEmail || '';
 
-      const medicine = parseTabularLine(line, columnMap);
-      if (medicine && medicine.medicine_name) {
-        medicine.bill_date = medicine.bill_date || billDate;
-        medicine.distributor_name = medicine.distributor_name || distributorName;
-        medicines.push(medicine);
+  // ── Strategy 1: Tabular header detection ──
+  let headerIdx = -1;
+  let headerFields = {}; // maps column index → field key
+
+  for (let i = 0; i < lines.length; i++) {
+    const lower = lines[i].toLowerCase();
+    // A header must contain at least batch or expiry keywords
+    if (/\b(batch|b\.?\s*no)\b/i.test(lower) && /\b(expiry|exp)\b/i.test(lower)) {
+      headerIdx = i;
+      // Split header into tokens and map each
+      const tokens = lines[i].split(/\s{2,}|\t/).map(t => t.trim()).filter(Boolean);
+      for (let j = 0; j < tokens.length; j++) {
+        const field = matchColumn(tokens[j]);
+        if (field) headerFields[j] = field;
+      }
+      break;
+    }
+  }
+
+  if (headerIdx >= 0 && Object.keys(headerFields).length >= 2) {
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line || /^[\-=_]+$/.test(line) || /\btotal\b/i.test(line)) break;
+
+      const parts = line.split(/\s{2,}|\t/).map(s => s.trim()).filter(Boolean);
+      if (parts.length < 2) continue;
+
+      let med = '', batch = '', exp = '', mrp = null;
+
+      for (const [idx, field] of Object.entries(headerFields)) {
+        const val = (parts[parseInt(idx)] || '').trim();
+        if (!val) continue;
+        switch (field) {
+          case 'medicine_name': med = val; break;
+          case 'batch_no':      batch = val; break;
+          case 'expiry_date':   exp = val; break;
+          case 'mrp':
+            try { mrp = parseFloat(val); if (isNaN(mrp)) mrp = null; }
+            catch { mrp = null; }
+            break;
+        }
+      }
+
+      if (med || batch || exp) {
+        medicines.push({
+          medicine_name: med || '-',
+          batch_no: batch || '-',
+          expiry_date: normalizeDate(exp) || '-',
+          bill_date: billDate,
+          distributor_name: distributorName,
+          mrp: mrp,
+        });
       }
     }
   }
 
-  // Strategy 3: If no tabular data found, try regex-based extraction
+  // ── Strategy 2: Regex line scanning (fallback) ──
   if (medicines.length === 0) {
-    const batchRegex = /(?:batch|b\.?\s*no\.?|lot)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)/gi;
-    const expiryRegex =
-      /(?:exp(?:iry)?|expiration)\s*[:\-]?\s*(\d{1,2}[\/.\\-]\d{1,2}[\/.\\-]\d{2,4}|\w{3,9}\s*[\-\/]?\s*\d{2,4})/gi;
-
-    let match;
-    const entries = [];
+    const batchRe  = /\b(?:batch|b\.?\s*no\.?|lot)\s*[:\-]?\s*([A-Za-z0-9\-\/]+)/i;
+    const expiryRe = /\b(?:exp(?:iry)?|expiration|exp\s*dt)\s*[:\-]?\s*(\d{1,2}[\/.\\-]\d{1,2}[\/.\\-]\d{2,4}|\w{3,9}\s*[\-\/]?\s*\d{2,4})/i;
+    const mrpRe    = /\b(?:mrp|price|m\.r\.p)\s*[:\-]?\s*[₹$]?\s*([\d,]+\.?\d*)/i;
 
     for (const line of lines) {
-      const batchMatch = batchRegex.exec(line);
-      const expiryMatch = expiryRegex.exec(line);
-      batchRegex.lastIndex = 0;
-      expiryRegex.lastIndex = 0;
+      const batchMatch  = batchRe.exec(line);
+      const expiryMatch = expiryRe.exec(line);
+      const mrpMatch    = mrpRe.exec(line);
 
       if (batchMatch || expiryMatch) {
-        // Try to extract medicine name from the same line
+        // Extract medicine name by removing known patterns
         let name = line
-          .replace(batchRegex, '')
-          .replace(expiryRegex, '')
-          .replace(/\d+[\.\)]\s*/, '')
+          .replace(/\b(?:batch|b\.?\s*no\.?|lot)\s*[:\-]?\s*[A-Za-z0-9\-\/]+/gi, '')
+          .replace(/\b(?:exp(?:iry)?|expiration|exp\s*dt)\s*[:\-]?\s*\S+/gi, '')
+          .replace(/\b(?:mrp|price|m\.r\.p)\s*[:\-]?\s*[₹$]?\s*[\d,]+\.?\d*/gi, '')
+          .replace(/^\d+[\.\)]\s*/, '')
           .replace(/\s{2,}/g, ' ')
           .trim();
 
-        // Remove trailing numbers (quantities, rates, etc.)
         name = name.replace(/[\d\s\.\,]+$/, '').trim();
 
-        if (name.length > 2) {
-          entries.push({
-            medicine_name: name.substring(0, 100),
-            expiry_date: expiryMatch ? normalizeDate(expiryMatch[1]) : '',
-            batch_no: batchMatch ? batchMatch[1] : '',
+        let mrp = null;
+        if (mrpMatch) {
+          try { mrp = parseFloat(mrpMatch[1].replace(/,/g, '')); if (isNaN(mrp)) mrp = null; }
+          catch { mrp = null; }
+        }
+
+        if (name.length > 1 || batchMatch || expiryMatch) {
+          medicines.push({
+            medicine_name: name.length > 1 ? name.substring(0, 100) : '-',
+            batch_no: batchMatch ? batchMatch[1] : '-',
+            expiry_date: expiryMatch ? (normalizeDate(expiryMatch[1]) || '-') : '-',
             bill_date: billDate,
             distributor_name: distributorName,
+            mrp: mrp,
           });
         }
       }
     }
-
-    medicines.push(...entries);
   }
 
   return medicines;
 }
 
-/**
- * Detect column positions from a header line.
- */
-function detectColumns(headerLine) {
-  const lower = headerLine.toLowerCase();
-  const cols = {};
-
-  const patterns = [
-    { key: 'name', regex: /(?:name|product|item|particulars|description)/i },
-    { key: 'batch', regex: /(?:batch|b\.?\s*no|lot)/i },
-    { key: 'expiry', regex: /(?:expiry|exp\.?\s*(?:date)?|expiration)/i },
-    { key: 'date', regex: /(?:bill\s*date|invoice\s*date|date)/i },
-  ];
-
-  for (const p of patterns) {
-    const match = p.regex.exec(lower);
-    if (match) {
-      cols[p.key] = match.index;
-    }
-  }
-
-  return cols;
-}
+// ─── Date normalization ───
 
 /**
- * Parse a single tabular line using column positions.
- */
-function parseTabularLine(line) {
-  // Split by multiple spaces or tabs (common in PDF-extracted tables)
-  const parts = line.split(/\s{2,}|\t/).map((s) => s.trim()).filter(Boolean);
-  if (parts.length < 2) return null;
-
-  // Try to identify batch number and expiry date in the parts
-  let name = '';
-  let batch = '';
-  let expiry = '';
-
-  for (const part of parts) {
-    const isDate = /\d{1,2}[\/.\\-]\d{1,2}[\/.\\-]\d{2,4}|\w{3}\s*[\-\/]?\s*\d{2,4}/i.test(part);
-    const isBatch = /^[A-Za-z]{1,3}[\-\/]?\d{2,}/i.test(part) && !isDate;
-    const isNumber = /^\d+[\.\,]?\d*$/.test(part);
-
-    if (isDate && !expiry) {
-      expiry = normalizeDate(part);
-    } else if (isBatch && !batch) {
-      batch = part;
-    } else if (!isNumber && !name) {
-      name = part;
-    }
-  }
-
-  if (!name) return null;
-
-  return {
-    medicine_name: name.substring(0, 100),
-    expiry_date: expiry,
-    batch_no: batch,
-    bill_date: '',
-    distributor_name: '',
-  };
-}
-
-/**
- * Normalize various date formats to YYYY-MM-DD or MM/YYYY.
+ * Normalize various date formats to YYYY-MM-DD.
  */
 function normalizeDate(dateStr) {
-  if (!dateStr) return '';
+  if (!dateStr || dateStr === '-') return '';
 
-  // Handle Month-Year format: "Mar 2025", "March/2025", "03/2025"
-  const monthYearMatch = dateStr.match(
-    /^(\w{3,9})\s*[\-\/]?\s*(\d{4})$/i
-  );
-  if (monthYearMatch) {
-    const month = parseMonth(monthYearMatch[1]);
-    if (month) return `${monthYearMatch[2]}-${month}-01`;
+  const s = String(dateStr).trim();
+
+  // "Mar 2025", "March/2025", "March-2025"
+  const monthYear = s.match(/^(\w{3,9})\s*[\-\/]?\s*(\d{4})$/i);
+  if (monthYear) {
+    const m = parseMonth(monthYear[1]);
+    if (m) return `${monthYear[2]}-${m}-01`;
   }
 
-  // Handle MM/YYYY
-  const mmYYYY = dateStr.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{4})$/);
+  // "03/2025", "3-2025"
+  const mmYYYY = s.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{4})$/);
   if (mmYYYY) {
-    const m = mmYYYY[1].padStart(2, '0');
-    return `${mmYYYY[2]}-${m}-01`;
+    return `${mmYYYY[2]}-${mmYYYY[1].padStart(2, '0')}-01`;
   }
 
-  // Handle DD/MM/YYYY or DD-MM-YYYY
-  const ddmmyyyy = dateStr.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{1,2})\s*[\/.\\-]\s*(\d{4})$/);
+  // DD/MM/YYYY
+  const ddmmyyyy = s.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{1,2})\s*[\/.\\-]\s*(\d{4})$/);
   if (ddmmyyyy) {
-    const d = ddmmyyyy[1].padStart(2, '0');
-    const m = ddmmyyyy[2].padStart(2, '0');
-    return `${ddmmyyyy[3]}-${m}-${d}`;
+    return `${ddmmyyyy[3]}-${ddmmyyyy[2].padStart(2, '0')}-${ddmmyyyy[1].padStart(2, '0')}`;
   }
 
-  // Handle DD/MM/YY or DD-MM-YY
-  const ddmmyy = dateStr.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{1,2})\s*[\/.\\-]\s*(\d{2})$/);
+  // DD/MM/YY
+  const ddmmyy = s.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{1,2})\s*[\/.\\-]\s*(\d{2})$/);
   if (ddmmyy) {
-    const d = ddmmyy[1].padStart(2, '0');
-    const m = ddmmyy[2].padStart(2, '0');
     const y = parseInt(ddmmyy[3]) > 50 ? `19${ddmmyy[3]}` : `20${ddmmyy[3]}`;
-    return `${y}-${m}-${d}`;
+    return `${y}-${ddmmyy[2].padStart(2, '0')}-${ddmmyy[1].padStart(2, '0')}`;
   }
 
-  return dateStr;
+  // "MM/YY" e.g. "03/26"
+  const mmyy = s.match(/^(\d{1,2})\s*[\/.\\-]\s*(\d{2})$/);
+  if (mmyy) {
+    const y = parseInt(mmyy[2]) > 50 ? `19${mmyy[2]}` : `20${mmyy[2]}`;
+    return `${y}-${mmyy[1].padStart(2, '0')}-01`;
+  }
+
+  // "Mar-26", "Mar 26" (month-year short)
+  const monYY = s.match(/^(\w{3,9})\s*[\-\/]?\s*(\d{2})$/i);
+  if (monYY) {
+    const m = parseMonth(monYY[1]);
+    if (m) {
+      const y = parseInt(monYY[2]) > 50 ? `19${monYY[2]}` : `20${monYY[2]}`;
+      return `${y}-${m}-01`;
+    }
+  }
+
+  return s;
 }
 
 function parseMonth(monthStr) {
@@ -302,16 +313,19 @@ function parseMonth(monthStr) {
   return months[monthStr.toLowerCase()] || null;
 }
 
+// ─── Entry point ───
+
 /**
- * Identify file type and parse accordingly.
+ * Parse a bill file (PDF, Excel, CSV).
+ * senderEmail is optionally passed from email-fetch flow for distributor fallback.
  */
-async function parseBill(buffer, filename) {
+async function parseBill(buffer, filename, senderEmail = '') {
   const ext = filename.toLowerCase().split('.').pop();
 
   if (ext === 'pdf') {
-    return await parsePdf(buffer);
+    return await parsePdf(buffer, senderEmail);
   } else if (['xlsx', 'xls', 'csv'].includes(ext)) {
-    return parseExcel(buffer);
+    return parseExcel(buffer, senderEmail);
   }
 
   throw new Error(`Unsupported file type: ${ext}`);
